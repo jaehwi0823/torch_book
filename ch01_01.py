@@ -251,6 +251,9 @@ for name, param in net.named_parameters():
     else:
         param.requires_grad = False
 
+for name, param in net.named_parameters():
+    print(name)
+
 # params_to_update의 내용을 확인
 print("-----------")
 print(params_to_update)
@@ -273,6 +276,7 @@ def train_model(net, dataloaders_dict, criterion, optimizer, num_epochs):
                 net.train()  # 모델을 훈련 모드로
             else:
                 net.eval()   # 모델을 검증 모드로
+
 
             epoch_loss = 0.0  # epoch 손실의 합
             epoch_corrects = 0  # epoch 정답의 수
@@ -299,6 +303,8 @@ def train_model(net, dataloaders_dict, criterion, optimizer, num_epochs):
                         loss.backward()
                         optimizer.step()
 
+
+
                     # 반복 결과 계산
                     # loss 합계 갱신
                     epoch_loss += loss.item() * inputs.size(0)  
@@ -322,8 +328,9 @@ train_model(net, dataloaders_dict, criterion, optimizer, num_epochs=num_epochs)
 
 # 튜토리얼과 비교
 def train_model(model, criterion, optimizer, scheduler, num_epochs=25):
-    since = time.time()
 
+    # logging & saving part
+    since = time.time()
     best_model_wts = copy.deepcopy(model.state_dict())
     best_acc = 0.0
 
@@ -331,12 +338,14 @@ def train_model(model, criterion, optimizer, scheduler, num_epochs=25):
         print('Epoch {}/{}'.format(epoch, num_epochs - 1))
         print('-' * 10)
 
+
         # 각 에폭(epoch)은 학습 단계와 검증 단계를 갖습니다.
         for phase in ['train', 'val']:
             if phase == 'train':
                 model.train()  # 모델을 학습 모드로 설정
             else:
                 model.eval()   # 모델을 평가 모드로 설정
+
 
             running_loss = 0.0
             running_corrects = 0
@@ -364,6 +373,7 @@ def train_model(model, criterion, optimizer, scheduler, num_epochs=25):
                 # 통계
                 running_loss += loss.item() * inputs.size(0)
                 running_corrects += torch.sum(preds == labels.data)
+            
             if phase == 'train':
                 scheduler.step()
 
