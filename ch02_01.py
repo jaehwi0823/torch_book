@@ -1,15 +1,21 @@
 # 패키지 import
 import os.path as osp
 import random
-# 파일이나 텍스트에서 XML을 읽고, 가공하고 저장하기 위한 라이브러리
 import xml.etree.ElementTree as ET
-
+from math import sqrt
+from itertools import product
+import pandas as pd
 import cv2
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
 import torch.utils.data as data
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.nn.init as init
+from torch.autograd import Function
 
+from utils.data_augumentation import Compose, ConvertFromInts, ToAbsoluteCoords, PhotometricDistort, Expand, RandomSampleCrop, RandomMirror, ToPercentCoords, Resize, SubtractMeans
 %matplotlib inline
 
 
@@ -20,7 +26,7 @@ random.seed(1234)
 
 
 # 학습 및 검증용 화상 데이터, 어노테이션 데이터의 파일 경로 리스트를 작성
-def make_datapath_list(rootpath):
+def make_datapath_list():
     """
     데이터의 경로를 저장한 리스트를 작성한다.
 
@@ -34,6 +40,7 @@ def make_datapath_list(rootpath):
     ret : train_img_list, train_anno_list, val_img_list, val_anno_list
         데이터의 경로를 저장한 리스트
     """
+    rootpath = './data/VOCdevkit/VOC2012/'
 
     # 화상 파일과 어노테이션 파일의 경로 템플릿을 작성
     imgpath_template = osp.join(rootpath, 'JPEGImages', '%s.jpg')
@@ -66,3 +73,688 @@ def make_datapath_list(rootpath):
         val_anno_list.append(anno_path)  # 리스트에 추가
 
     return train_img_list, train_anno_list, val_img_list, val_anno_list
+
+
+# "XML 형식의 어노테이션"을 리스트 형식으로 변환하는 클래스
+class Anno_xml2list(object):
+    """
+    한 장의 이미지에 대한 "XML 형식의 어노테이션 데이터"를 화상 크기로 규격화해 리스트 형식으로 변환한다.
+
+    Attributes
+    ----------
+    classes : 리스트
+        VOC의 클래스명을 저장한 리스트
+    """
+
+    def __init__(self, classes):
+
+        self.classes = classes
+
+    def __call__(self, xml_path, width, height):
+        """
+        한 장의 이미지에 대한 "XML 형식의 어노테이션 데이터"를 화상 크기로 규격화해 리스트 형식으로 변환한다.
+
+        Parameters
+        ----------
+        xml_path : str
+            xml 파일의 경로.
+        width : int
+            대상 화상의 폭.
+        height : int
+            대상 화상의 높이.
+
+        Returns
+        -------
+        ret : [[xmin, ymin, xmax, ymax, label_ind], ... ]
+            물체의 어노테이션 데이터를 저장한 리스트. 이미지에 존재하는 물체수만큼의 요소를 가진다.
+        """
+
+        # 화상 내 모든 물체의 어노테이션을 이 리스트에 저장합니다
+        ret = []
+
+        # xml 파일을 로드
+        xml = ET.parse(xml_path).getroot()
+
+        # 화상 내에 있는 물체(object)의 수만큼 반복
+        for obj in xml.iter('object'):
+
+            # 어노테이션에서 감지가 difficult로 설정된 것은 제외
+            difficult = int(obj.find('difficult').text)
+            if difficult == 1:
+                continue
+
+            # 한 물체의 어노테이션을 저장하는 리스트
+            bndbox = []
+
+            name = obj.find('name').text.lower().strip()  # 물체 이름
+            bbox = obj.find('bndbox')  # 바운딩 박스 정보
+
+            # 어노테이션의 xmin, ymin, xmax, ymax를 취득하고, 0~1으로 규격화
+            pts = ['xmin', 'ymin', 'xmax', 'ymax']
+
+            for pt in (pts):
+                # VOC는 원점이 (1,1)이므로 1을 빼서 (0, 0)으로 한다
+                cur_pixel = int(bbox.find(pt).text) - 1
+
+                # 폭, 높이로 규격화
+                if pt == 'xmin' or pt == 'xmax':  # x 방향의 경우 폭으로 나눈다
+                    cur_pixel /= width
+                else:  # y 방향의 경우 높이로 나눈다
+                    cur_pixel /= height
+
+                bndbox.append(cur_pixel)
+
+            # 어노테이션의 클래스명 index를 취득하여 추가
+            label_idx = self.classes.index(name)
+            bndbox.append(label_idx)
+
+            # res에 [xmin, ymin, xmax, ymax, label_ind]을 더한다
+            ret += [bndbox]
+
+        return np.array(ret)  # [[xmin, ymin, xmax, ymax, label_ind], ... ]
+
+
+# 동작 확인
+voc_classes = ['aeroplane', 'bicycle', 'bird', 'boat',
+               'bottle', 'bus', 'car', 'cat', 'chair',
+               'cow', 'diningtable', 'dog', 'horse',
+               'motorbike', 'person', 'pottedplant',
+               'sheep', 'sofa', 'train', 'tvmonitor']
+
+transform_anno = Anno_xml2list(voc_classes)
+
+# 화상 로드용으로 OpenCV를 사용
+ind = 1
+train_img_list, train_anno_list, val_img_list, val_anno_list = make_datapath_list()
+image_file_path = val_img_list[ind]
+img = cv2.imread(image_file_path)  # [높이][폭][색BGR]
+height, width, channels = img.shape  # 화상 크기 취득
+
+# 어노테이션을 리스트로 표시
+transform_anno(val_anno_list[ind], width, height)
+
+
+
+
+class DataTransform():
+    """
+    화상과 어노테이션의 전처리 클래스. 훈련과 추론에서 다르게 작동한다.
+    화상의 크기를 300x300으로 한다.
+    학습시 데이터 확장을 수행한다.
+
+    Attributes
+    ----------
+    input_size : int
+        리사이즈 대상 화상의 크기.
+    color_mean : (B, G, R)
+        각 색상 채널의 평균값.
+    """
+
+    def __init__(self, input_size, color_mean):
+        self.data_transform = {
+            'train': Compose([
+                ConvertFromInts(),  # int를 float32로 변환
+                ToAbsoluteCoords(),  # 어노테이션 데이터의 규격화를 반환
+                PhotometricDistort(),  # 화상의 색조 등을 임의로 변화시킴
+                Expand(color_mean),  # 화상의 캔버스를 확대
+                RandomSampleCrop(),  # 화상 내의 특정 부분을 무작위로 추출
+                RandomMirror(),  # 화상을 반전시킨다
+                ToPercentCoords(),  # 어노테이션 데이터를 0-1로 규격화
+                Resize(input_size),  # 화상 크기를 input_size × input_size로 변형
+                SubtractMeans(color_mean)  # BGR 색상의 평균값을 뺀다
+            ]),
+            'val': Compose([
+                ConvertFromInts(),  # int를 float로 변환
+                Resize(input_size),  # 화상 크기를 input_size × input_size로 변형
+                SubtractMeans(color_mean)  # BGR 색상의 평균값을 뺀다
+            ])
+        }
+
+    def __call__(self, img, phase, boxes, labels):
+        """
+        Parameters
+        ----------
+        phase : 'train' or 'val'
+            전처리 모드를 지정.
+        """
+        return self.data_transform[phase](img, boxes, labels)
+
+
+# 동작 확인
+
+# 1. 화상 읽기
+image_file_path = train_img_list[0]
+img = cv2.imread(image_file_path)  # [높이][폭][색BGR]
+height, width, channels = img.shape  # 화상의 크기 취득
+
+# 2. 어노테이션을 리스트로
+transform_anno = Anno_xml2list(voc_classes)
+anno_list = transform_anno(train_anno_list[0], width, height)
+
+# 3. 원래 화상을 표시
+plt.imshow(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
+plt.show()
+
+# 4. 전처리 클래스 작성
+color_mean = (104, 117, 123)  # (BGR) 색상의 평균값
+input_size = 300  # 화상의 input 사이즈를 300×300으로
+transform = DataTransform(input_size, color_mean)
+
+# 5. train화상의 표시
+phase = "train"
+img_transformed, boxes, labels = transform(
+    img, phase, anno_list[:, :4], anno_list[:, 4])
+plt.imshow(cv2.cvtColor(img_transformed, cv2.COLOR_BGR2RGB))
+plt.show()
+
+
+# 6. val화상의 표시
+phase = "val"
+img_transformed, boxes, labels = transform(
+    img, phase, anno_list[:, :4], anno_list[:, 4])
+plt.imshow(cv2.cvtColor(img_transformed, cv2.COLOR_BGR2RGB))
+plt.show()
+
+
+# VOC2012의 Dataset을 작성
+class VOCDataset(data.Dataset):
+    """
+    VOC2012의 Dataset을 만드는 클래스. PyTorch의 Dataset 클래스를 상속받는다.
+
+    Attributes
+    ----------
+    img_list : 리스트
+        화상의 경로를 저장한 리스트
+    anno_list : 리스트
+        어노테이션의 경로를 저장한 리스트
+    phase : 'train' or 'test'
+        학습 또는 훈련을 설정한다.
+    transform : object
+        전처리 클래스의 인스턴스
+    transform_anno : object
+        xml 어노테이션을 리스트로 변환하는 인스턴스
+    """
+
+    def __init__(self, img_list, anno_list, phase, transform, transform_anno):
+        self.img_list = img_list
+        self.anno_list = anno_list
+        self.phase = phase  # train 또는 val을 지정
+        self.transform = transform  # 화상의 변형
+        self.transform_anno = transform_anno  # 어노테이션 데이터를 xml에서 리스트로 변경
+
+    def __len__(self):
+        '''화상의 매수를 반환'''
+        return len(self.img_list)
+
+    def __getitem__(self, index):
+        '''
+        전처리한 화상의 텐서 형식 데이터와 어노테이션을 취득
+        '''
+        im, gt, h, w = self.pull_item(index)
+        return im, gt
+
+    def pull_item(self, index):
+        '''전처리한 화상의 텐서 형식 데이터, 어노테이션, 화상의 높이, 폭을 취득한다'''
+
+        # 1. 화상 읽기
+        image_file_path = self.img_list[index]
+        img = cv2.imread(image_file_path)  # [높이][폭][색BGR]
+        height, width, channels = img.shape  # 화상의 크기 취득
+
+        # 2. xml 형식의 어노테이션 정보를 리스트에 저장
+        anno_file_path = self.anno_list[index]
+        anno_list = self.transform_anno(anno_file_path, width, height)
+
+        # 3. 전처리 실시
+        img, boxes, labels = self.transform(
+            img, self.phase, anno_list[:, :4], anno_list[:, 4])
+
+        # 색상 채널의 순서가 BGR이므로 RGB로 순서를 변경
+        # 또한 (높이, 폭, 색상 채널)의 순서를 (색상 채널, 높이, 폭)으로 변경
+        img = torch.from_numpy(img[:, :, (2, 1, 0)]).permute(2, 0, 1)
+
+        # BBox와 라벨을 세트로 한 np.array를 작성, 변수 이름 "gt"는 ground truth의 약칭
+        gt = np.hstack((boxes, np.expand_dims(labels, axis=1)))
+
+        return img, gt, height, width
+
+# 동작 확인
+color_mean = (104, 117, 123)  # (BGR) 색의 평균값
+input_size = 300  # 화상의 input 사이즈를 300×300으로 함
+
+train_dataset = VOCDataset(train_img_list, train_anno_list, phase="train", transform=DataTransform(
+    input_size, color_mean), transform_anno=Anno_xml2list(voc_classes))
+
+val_dataset = VOCDataset(val_img_list, val_anno_list, phase="val", transform=DataTransform(
+    input_size, color_mean), transform_anno=Anno_xml2list(voc_classes))
+
+
+# 데이터 출력의 예
+val_dataset.__getitem__(1)
+
+# dataloader
+def od_collate_fn(batch):
+    """
+    Dataset에서 꺼내는 어노테이션 데이터의 크기는 화상마다 다릅니다.
+    화상 내의 물체 수가 2개이면 (2, 5) 이지만, 3개이면 (3, 5) 등으로 변화합니다.
+    이러한 변화에 대응한 DataLoader을 작성하기 위해 커스터마이즈한 collate_fn을 만듭니다.
+    collate_fn은 PyTorch 리스트로 mini-batch를 작성하는 함수입니다.
+    미니 배치 분량의 화상이 나열된 리스트 변수 batch에 미니 배치 번호를 지정하는 차원을 선두에 하나 추가하여 리스트의 형태를 바꿉니다.
+    """
+
+    targets = []
+    imgs = []
+    for sample in batch:
+        imgs.append(sample[0])  # sample[0]은 화상img입니다
+        targets.append(torch.FloatTensor(sample[1]))  # sample[1]은 어노테이션 gt입니다
+
+    # imgs는 미니 배치 크기의 리스트입니다
+    # 리스트의 요소는 torch.Size([3, 300, 300]) 입니다
+    # 이 리스트를 torch.Size([batch_num, 3, 300, 300])의 텐서로 변환합니다
+    imgs = torch.stack(imgs, dim=0)
+
+    # targets은 어노테이션의 정답인 gt의 리스트입니다
+    # 리스트의 크기는 미니 배치의 크기가 됩니다
+    # targets 리스트의 요소는 [n, 5] 로 되어 있습니다
+    # n은 화상마다 다르며, 화상 속 물체의 수입니다
+    # 5는 [xmin, ymin, xmax, ymax, class_index] 입니다
+
+    return imgs, targets
+
+# 데이터 로더 작성
+
+batch_size = 4
+
+train_dataloader = data.DataLoader(
+    train_dataset, batch_size=batch_size, shuffle=True, collate_fn=od_collate_fn)
+
+val_dataloader = data.DataLoader(
+    val_dataset, batch_size=batch_size, shuffle=False, collate_fn=od_collate_fn)
+
+# 사전형 변수에 정리
+dataloaders_dict = {"train": train_dataloader, "val": val_dataloader}
+
+# 동작 확인
+batch_iterator = iter(dataloaders_dict["val"])  # 반복자로 변환
+images, targets = next(batch_iterator)  # 첫 번째 요소를 추출
+print(images.size())  # torch.Size([4, 3, 300, 300])
+print(len(targets))
+print(targets[1].size())  # 미니 배치 크기의 리스트, 각 요소는 [n, 5], n은 물체 수
+
+
+# 34층에 걸쳐, vgg모듈을 작성
+def make_vgg():
+    layers = []
+    in_channels = 3  # 색 채널 수 
+
+    # vgg 모듈에서 사용하는 합성곱 층이나 맥스 풀링의 채널 수
+    cfg = [64, 64, 'M', 128, 128, 'M', 256, 256,
+           256, 'MC', 512, 512, 512, 'M', 512, 512, 512]
+
+    for v in cfg:
+        if v == 'M':
+            layers += [nn.MaxPool2d(kernel_size=2, stride=2)]
+        elif v == 'MC':
+            # ceil은 출력 크기를 계산 결과(float)에 대해, 소수점을 올려 정수로 하는 모드
+            # 디폴트는 출력 크기를 계산 결과(float)에 대해, 소수점을 버려 정수로 하는 floor 모드
+            layers += [nn.MaxPool2d(kernel_size=2, stride=2, ceil_mode=True)]
+        else:
+            conv2d = nn.Conv2d(in_channels, v, kernel_size=3, padding=1)
+            layers += [conv2d, nn.ReLU(inplace=True)]
+            in_channels = v
+
+    pool5 = nn.MaxPool2d(kernel_size=3, stride=1, padding=1)
+    conv6 = nn.Conv2d(512, 1024, kernel_size=3, padding=6, dilation=6)
+    conv7 = nn.Conv2d(1024, 1024, kernel_size=1)
+    layers += [pool5, conv6,
+               nn.ReLU(inplace=True), conv7, nn.ReLU(inplace=True)]
+    return nn.ModuleList(layers)
+
+
+# 동작 확인
+vgg_test = make_vgg()
+print(vgg_test)
+
+
+# 8층에 걸친 extras모듈 작성
+def make_extras():
+    layers = []
+    in_channels = 1024  # vgg모듈에서 출력된, extra에 입력되는 화상 채널 수
+
+    # extra모듈의 합성곱층의 채널수를 설정하는 구성(configuration)
+    cfg = [256, 512, 128, 256, 128, 256, 128, 256]
+
+    layers += [nn.Conv2d(in_channels, cfg[0], kernel_size=(1))]
+    layers += [nn.Conv2d(cfg[0], cfg[1], kernel_size=(3), stride=2, padding=1)]
+    layers += [nn.Conv2d(cfg[1], cfg[2], kernel_size=(1))]
+    layers += [nn.Conv2d(cfg[2], cfg[3], kernel_size=(3), stride=2, padding=1)]
+    layers += [nn.Conv2d(cfg[3], cfg[4], kernel_size=(1))]
+    layers += [nn.Conv2d(cfg[4], cfg[5], kernel_size=(3))]
+    layers += [nn.Conv2d(cfg[5], cfg[6], kernel_size=(1))]
+    layers += [nn.Conv2d(cfg[6], cfg[7], kernel_size=(3))]
+    
+    # 활성화 함수의 ReLU는 이번에는 SSD모듈의 순전파 속에서 준비하는 것으로 하고,
+    # extra모듈에서는 준비하지 않음
+
+    return nn.ModuleList(layers)
+
+# 동작 확인
+extras_test = make_extras()
+print(extras_test)
+
+
+# 디폴트 박스의 오프셋을 출력하는 loc_layers,
+# 디폴트 박스에 대한 각 클래스의 신뢰도 confidence를 출력하는 conf_layers를 작성
+def make_loc_conf(num_classes=21, bbox_aspect_num=[4, 6, 6, 6, 4, 4]):
+
+    loc_layers = []
+    conf_layers = []
+
+    # VGG의 22층, conv4_3(source1)에 대한 합성곱층
+    loc_layers += [nn.Conv2d(512, bbox_aspect_num[0]
+                             * 4, kernel_size=3, padding=1)]
+    conf_layers += [nn.Conv2d(512, bbox_aspect_num[0]
+                              * num_classes, kernel_size=3, padding=1)]
+
+    # VGG의 최종층(source2)에 대한 합성곱층
+    loc_layers += [nn.Conv2d(1024, bbox_aspect_num[1]
+                             * 4, kernel_size=3, padding=1)]
+    conf_layers += [nn.Conv2d(1024, bbox_aspect_num[1]
+                              * num_classes, kernel_size=3, padding=1)]
+
+    # extra(source3)에 대한 합성곱층
+    loc_layers += [nn.Conv2d(512, bbox_aspect_num[2]
+                             * 4, kernel_size=3, padding=1)]
+    conf_layers += [nn.Conv2d(512, bbox_aspect_num[2]
+                              * num_classes, kernel_size=3, padding=1)]
+
+    # extra(source4)에 대한 합성곱층
+    loc_layers += [nn.Conv2d(256, bbox_aspect_num[3]
+                             * 4, kernel_size=3, padding=1)]
+    conf_layers += [nn.Conv2d(256, bbox_aspect_num[3]
+                              * num_classes, kernel_size=3, padding=1)]
+
+    # extra(source5)에 대한 합성곱층
+    loc_layers += [nn.Conv2d(256, bbox_aspect_num[4]
+                             * 4, kernel_size=3, padding=1)]
+    conf_layers += [nn.Conv2d(256, bbox_aspect_num[4]
+                              * num_classes, kernel_size=3, padding=1)]
+
+    # extra(source6)에 대한 합성곱층
+    loc_layers += [nn.Conv2d(256, bbox_aspect_num[5]
+                             * 4, kernel_size=3, padding=1)]
+    conf_layers += [nn.Conv2d(256, bbox_aspect_num[5]
+                              * num_classes, kernel_size=3, padding=1)]
+
+    return nn.ModuleList(loc_layers), nn.ModuleList(conf_layers)
+
+# 동작 확인
+loc_test, conf_test = make_loc_conf()
+print(loc_test)
+print(conf_test)
+
+
+# convC4_3로부터의 출력을 scale=20의 L2Norm으로 정규화하는 층
+class L2Norm(nn.Module):
+    def __init__(self, input_channels=512, scale=20):
+        super(L2Norm, self).__init__()  # 부모 클래스의 생성자 실행
+        self.weight = nn.Parameter(torch.Tensor(input_channels))
+        self.scale = scale  # 계수 weight의 초기값으로 설정할 값
+        self.reset_parameters()  # 파라미터의 초기화
+        self.eps = 1e-10
+
+    def reset_parameters(self):
+        '''결합 파라미터의 scale크기 값으로 초기화 실행'''
+        init.constant_(self.weight, self.scale)  # weight의 값이 모두 scale(=20)이 된다
+
+    def forward(self, x):
+        '''38×38의 특징량에 대해 512 채널에 걸쳐 제곱합의 루트를 구했다
+        38×38개의 값을 사용하여 각 특징량을 정규화한 후 계수를 곱하여 계산하는 층'''
+
+        # 각 채널에서의 38×38개의 특징량의 채널 방향의 제곱합을 계산하고,
+        # 또한 루트를 구해 나누어 정규화한다
+        # norm의 텐서 사이즈는 torch.Size([batch_num, 1, 38, 38])입니다
+        norm = x.pow(2).sum(dim=1, keepdim=True).sqrt()+self.eps
+        x = torch.div(x, norm)
+
+        # 계수를 곱한다. 계수는 채널마다 하나로, 512개의 계수를 갖는다
+        # self.weight의 텐서 사이즈는 torch.Size([512])이므로
+        # torch.Size([batch_num, 512, 38, 38])까지 변형합니다
+        weights = self.weight.unsqueeze(
+            0).unsqueeze(2).unsqueeze(3).expand_as(x)
+        out = weights * x
+
+        return out
+
+
+# 디폴트 박스를 출력하는 클래스
+class DBox(object):
+    def __init__(self, cfg):
+        super(DBox, self).__init__()
+
+        # 초기설정
+        self.image_size = cfg['input_size']  # 화상 크기 300
+        # [38, 19, …] 각 source의 특징량 맵의 크기
+        self.feature_maps = cfg['feature_maps']
+        self.num_priors = len(cfg["feature_maps"])  # source의 개수 6
+        self.steps = cfg['steps']  # [8, 16, …] DBox의 픽셀 크기
+        
+        self.min_sizes = cfg['min_sizes']
+        # [30, 60, …] 작은 정사각형의 DBox 픽셀 크기(정확히는 면적)
+        
+        self.max_sizes = cfg['max_sizes']
+        # [60, 111, …] 큰 정사각형의 DBox 픽셀 크기(정확히는 면적)
+        
+        self.aspect_ratios = cfg['aspect_ratios']  # 정사각형의 DBox의 화면비(종횡비)
+
+    def make_dbox_list(self):
+        '''DBox를 작성한다'''
+        mean = []
+        # 'feature_maps': [38, 19, 10, 5, 3, 1]
+        for k, f in enumerate(self.feature_maps):
+            # f까지의 수로 두 쌍의 조합을 작성한다 f_P_2개
+            for i, j in product(range(f), repeat=2):
+                # 특징량의 화상 크기
+                # 300 / 'steps': [8, 16, 32, 64, 100, 300],
+                f_k = self.image_size / self.steps[k]
+
+                # DBox의 중심 좌표 x,y. 0~1로 정규화되어 있음
+                cx = (j + 0.5) / f_k
+                cy = (i + 0.5) / f_k
+
+                # 화면비 1의 작은 DBox [cx,cy, width, height]
+                # 'min_sizes': [30, 60, 111, 162, 213, 264]
+                s_k = self.min_sizes[k]/self.image_size
+                mean += [cx, cy, s_k, s_k]
+
+                # 화면비 1의 큰 DBox [cx,cy, width, height]
+                # 'max_sizes': [60, 111, 162, 213, 264, 315],
+                s_k_prime = sqrt(s_k * (self.max_sizes[k]/self.image_size))
+                mean += [cx, cy, s_k_prime, s_k_prime]
+
+                # 그 외 화면비의 defBox [cx,cy, width, height]
+                for ar in self.aspect_ratios[k]:
+                    mean += [cx, cy, s_k*sqrt(ar), s_k/sqrt(ar)]
+                    mean += [cx, cy, s_k/sqrt(ar), s_k*sqrt(ar)]
+
+        # DBox를 텐서로 변환 torch.Size([8732, 4])
+        output = torch.Tensor(mean).view(-1, 4)
+
+        # DBox가 화상 밖으로 돌출되는 것을 막기 위해, 크기를 최소 0, 최대 1로 한다
+        output.clamp_(max=1, min=0)
+
+        return output
+
+# DBox 동작 확인
+# SSD300 설정
+ssd_cfg = {
+    'num_classes': 21,  # 배경 클래스를 포함한 총 클래스 수
+    'input_size': 300,  # 화상의 입력 크기
+    'bbox_aspect_num': [4, 6, 6, 6, 4, 4],  # 출력할 Box 화면비의 종류
+    'feature_maps': [38, 19, 10, 5, 3, 1],  # 각 source의 화상 크기
+    'steps': [8, 16, 32, 64, 100, 300],  # DBOX의 크기를 정한다
+    'min_sizes': [30, 60, 111, 162, 213, 264],  # DBOX의 크기를 정한다
+    'max_sizes': [60, 111, 162, 213, 264, 315],  # DBOX의 크기를 정한다
+    'aspect_ratios': [[2], [2, 3], [2, 3], [2, 3], [2], [2]],
+}
+
+# DBox 작성
+dbox = DBox(ssd_cfg)
+dbox_list = dbox.make_dbox_list()
+
+# DBox 출력을 확인한다
+pd.DataFrame(dbox_list.numpy())
+
+
+# SSD 추론시에 conf와 loc의 출력에서 겹침(중복)을 제거한 BBox를 출력한다
+class Detect(Function):
+
+    def __init__(self, conf_thresh=0.01, top_k=200, nms_thresh=0.45):
+        self.softmax = nn.Softmax(dim=-1)  # conf를 소프트맥스 함수로 정규화하기 위해 준비
+        self.conf_thresh = conf_thresh  # conf가 conf_thresh=0.01보다 높은 DBox만을 취급
+        self.top_k = top_k  # nm_supression으로 conf가 높은 top_k개의 계산에 사용하는, top_k = 200
+        self.nms_thresh = nms_thresh  # nm_supression으로 IOU가 nms_thresh=0.45보다 크면 동일한 물체의 BBox로 간주
+
+    def forward(self, loc_data, conf_data, dbox_list):
+        """
+        순전파 계산을 수행한다.
+
+        Parameters
+        ----------
+        loc_data:  [batch_num,8732,4]
+            오프셋 정보
+        conf_data: [batch_num, 8732,num_classes]
+            감지 신뢰도
+        dbox_list: [8732,4]
+            DBox의 정보
+
+        Returns
+        -------
+        output : torch.Size([batch_num, 21, 200, 5])
+            (batch_num, 클래스, conf의 top200, BBox 정보)
+        """
+
+        # 각 크기를 취득
+        num_batch = loc_data.size(0)  # 미니 배치 크기
+        num_dbox = loc_data.size(1)  # DBox 수 = 8732
+        num_classes = conf_data.size(2)  # 클래스 수 = 21
+
+        # conf는 소프트맥스를 적용하여 정규화한다
+        conf_data = self.softmax(conf_data)
+
+        # 출력 형식을 작성한다. 텐서 크기는 [minibatch수, 21, 200, 5]
+        output = torch.zeros(num_batch, num_classes, self.top_k, 5)
+
+        # cof_data를 [batch_num,8732,num_classes]에서 [batch_num, num_classes,8732]에 순서 변경
+        conf_preds = conf_data.transpose(2, 1)
+
+        # 미니 배치마다 루프
+        for i in range(num_batch):
+
+            # 1. loc와 DBox로 수정한 BBox [xmin, ymin, xmax, ymax] 를 구한다
+            decoded_boxes = decode(loc_data[i], dbox_list)
+
+            # conf의 복사본을 작성
+            conf_scores = conf_preds[i].clone()
+
+            # 화상 클래스별 루프(배경 클래스의 index인 0은 계산하지 않고, index=1부터)
+            for cl in range(1, num_classes):
+
+                # 2.conf의 임계값을 넘은 BBox를 꺼낸다
+                # conf의 임계값을 넘고 있는지에 대한 마스크를 작성하여,
+                # 임계값을 넘은 conf의 인덱스를 c_mask로 취득
+                c_mask = conf_scores[cl].gt(self.conf_thresh)
+                # gt는 Greater than을 의미. gt에 의해 임계값을 넘은 것이 1, 이하는 0이 된다.
+                # conf_scores:torch.Size([21, 8732])
+                # c_mask:torch.Size([8732])
+
+                # scores는 torch.Size([임계값을 넘은 BBox 수])
+                scores = conf_scores[cl][c_mask]
+
+                # 임계값을 넘은 conf가 없는 경우, 즉 scores=[]의 경우에는 아무것도 하지 않는다
+                if scores.nelement() == 0:  # nelement로 요소수의 함계를 구한다
+                    continue
+
+                # c_mask를 decoded_boxes에 적용할 수 있도록 크기를 변경합니다
+                l_mask = c_mask.unsqueeze(1).expand_as(decoded_boxes)
+                # l_mask:torch.Size([8732, 4])
+
+                # l_mask를 decoded_boxes로 적용합니다
+                boxes = decoded_boxes[l_mask].view(-1, 4)
+                # decoded_boxes[l_mask]로 1차원이 되어버리기 때문에,
+                # view에서 (임계값을 넘은 BBox 수, 4) 크기로 변형한다
+
+                # 3. Non-Maximum Suppression를 실시하여, 겹치는 BBox를 제거
+                ids, count = nm_suppression(
+                    boxes, scores, self.nms_thresh, self.top_k)
+                # ids: conf의 내림차순으로 Non-Maximum Suppression를 통과한 index가 저장됨
+                # count: Non-Maximum Suppression를 통과한 BBox 수
+
+                # output에 Non-Maximum Suppression를 뺀 결과를 저장
+                output[i, cl, :count] = torch.cat((scores[ids[:count]].unsqueeze(1),
+                                                   boxes[ids[:count]]), 1)
+
+        return output  # torch.Size([1, 21, 200, 5])
+
+
+# SSD 클래스를 작성한다
+class SSD(nn.Module):
+
+    def __init__(self, phase, cfg):
+        super(SSD, self).__init__()
+
+        self.phase = phase  # train or inference를 지정
+        self.num_classes = cfg["num_classes"]  # 클래스 수 21
+
+        # SSD 네트워크를 작성
+        self.vgg = make_vgg()
+        self.extras = make_extras()
+        self.L2Norm = L2Norm()
+        self.loc, self.conf = make_loc_conf(
+            cfg["num_classes"], cfg["bbox_aspect_num"])
+
+        # DBox 작성
+        dbox = DBox(cfg)
+        self.dbox_list = dbox.make_dbox_list()
+
+        # 추론시는 "Detect" 클래스를 준비합니다
+        if phase == 'inference':
+            self.detect = Detect()
+
+# 동작 확인
+ssd_test = SSD(phase="train", cfg=ssd_cfg)
+print(ssd_test)
+
+
+# 오프셋 정보를 이용하여 DBox를 BBox로 변환하는 함수
+def decode(loc, dbox_list):
+    """
+    오프셋 정보를 이용하여 DBox를 BBox로 변환한다.
+
+    Parameters
+    ----------
+    loc:  [8732,4]
+        SSD 모델로 추론하는 오프셋 정보.
+    dbox_list: [8732,4]
+        DBox 정보
+
+    Returns
+    -------
+    boxes : [xmin, ymin, xmax, ymax]
+        BBox 정보
+    """
+
+    # DBox는 [cx, cy, width, height]로 저장되어 있음
+    # loc도 [Δcx, Δcy, Δwidth, Δheight]로 저장되어 있음
+
+    # 오프셋 정보로 BBox를 구한다
+    boxes = torch.cat((
+        dbox_list[:, :2] + loc[:, :2] * 0.1 * dbox_list[:, 2:],
+        dbox_list[:, 2:] * torch.exp(loc[:, 2:] * 0.2)), dim=1)
+    # boxes의 크기는 torch.Size([8732, 4])가 됩니다
+
+    # BBox의 좌표정보를 [cx, cy, width, height]에서 [xmin, ymin, xmax, ymax]으로 변경
+    boxes[:, :2] -= boxes[:, 2:] / 2  # 좌표 (xmin,ymin)로 변환
+    boxes[:, 2:] += boxes[:, :2]  # 좌표 (xmax,ymax)로 변환
+
+    return boxes
