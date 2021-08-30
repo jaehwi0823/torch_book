@@ -606,6 +606,176 @@ dbox_list = dbox.make_dbox_list()
 pd.DataFrame(dbox_list.numpy())
 
 
+# SSD 클래스를 작성한다
+class SSD(nn.Module):
+
+    def __init__(self, phase, cfg):
+        super(SSD, self).__init__()
+
+        self.phase = phase  # train or inference를 지정
+        self.num_classes = cfg["num_classes"]  # 클래스 수 21
+
+        # SSD 네트워크를 작성
+        self.vgg = make_vgg()
+        self.extras = make_extras()
+        self.L2Norm = L2Norm()
+        self.loc, self.conf = make_loc_conf(
+            cfg["num_classes"], cfg["bbox_aspect_num"])
+
+        # DBox 작성
+        dbox = DBox(cfg)
+        self.dbox_list = dbox.make_dbox_list()
+
+        # 추론시는 "Detect" 클래스를 준비합니다
+        if phase == 'inference':
+            self.detect = Detect()
+
+# 동작 확인
+ssd_test = SSD(phase="train", cfg=ssd_cfg)
+print(ssd_test)
+
+
+# 오프셋 정보를 이용하여 DBox를 BBox로 변환하는 함수
+def decode(loc, dbox_list):
+    """
+    오프셋 정보를 이용하여 DBox를 BBox로 변환한다.
+
+    Parameters
+    ----------
+    loc:  [8732,4]
+        SSD 모델로 추론하는 오프셋 정보.
+    dbox_list: [8732,4]
+        DBox 정보
+
+    Returns
+    -------
+    boxes : [xmin, ymin, xmax, ymax]
+        BBox 정보
+    """
+
+    # DBox는 [cx, cy, width, height]로 저장되어 있음
+    # loc도 [Δcx, Δcy, Δwidth, Δheight]로 저장되어 있음
+
+    # 오프셋 정보로 BBox를 구한다
+    boxes = torch.cat((
+        dbox_list[:, :2] + loc[:, :2] * 0.1 * dbox_list[:, 2:],
+        dbox_list[:, 2:] * torch.exp(loc[:, 2:] * 0.2)), dim=1)
+    # boxes의 크기는 torch.Size([8732, 4])가 됩니다
+
+    # BBox의 좌표정보를 [cx, cy, width, height]에서 [xmin, ymin, xmax, ymax]으로 변경
+    boxes[:, :2] -= boxes[:, 2:] / 2  # 좌표 (xmin,ymin)로 변환
+    boxes[:, 2:] += boxes[:, :2]  # 좌표 (xmax,ymax)로 변환
+
+    return boxes
+
+
+# Non-Maximum Suppression을 실시하는 함수
+def nm_suppression(boxes, scores, overlap=0.45, top_k=200):
+    """
+    Non-Maximum Suppression을 실시하는 함수.
+    boxes 중에서 겹치는(overlap 이상)의 BBox를 삭제한다.
+
+    Parameters
+    ----------
+    boxes : [신뢰도 임계값(0.01)을 넘은 BBox 수,4]
+        BBox 정보
+    scores :[신뢰도 임계값(0.01)을 넘은 BBox 수]
+        conf 정보
+
+    Returns
+    -------
+    keep : 리스트
+        conf의 내림차순으로 nms를 통과한 index가 저장됨
+    count: int
+        nms를 통과한 BBox 수
+    """
+
+    # return의 모형을 작성
+    count = 0
+    keep = scores.new(scores.size(0)).zero_().long()
+    # keep: torch.Size([신뢰도 임계값을 넘은 BBox 수]), 요소는 전부 0
+
+    # 각 BBox의 면적 area를 계산
+    x1 = boxes[:, 0]
+    y1 = boxes[:, 1]
+    x2 = boxes[:, 2]
+    y2 = boxes[:, 3]
+    area = torch.mul(x2 - x1, y2 - y1)
+
+    # boxes를 복사한다. 나중에 BBox 중복도(IOU) 계산시의 모형으로 준비
+    tmp_x1 = boxes.new()
+    tmp_y1 = boxes.new()
+    tmp_x2 = boxes.new()
+    tmp_y2 = boxes.new()
+    tmp_w = boxes.new()
+    tmp_h = boxes.new()
+
+    # socre를 오름차순으로 나열한다
+    v, idx = scores.sort(0)
+
+    # 상위 top_k개(200개)의 BBox의 index를 꺼낸다(200개 존재하지 않는 경우도 있음)
+    idx = idx[-top_k:]
+
+    # idx의 요소수가 0가 아닌 한 루프한다
+    while idx.numel() > 0:
+        i = idx[-1]  # conf의 최대 index를 i로
+
+        # keep의 끝에 conf 최대 index를 저장
+        # 이 index의 BBox와 크게 겹치는 BBox를 삭제
+        keep[count] = i
+        count += 1
+
+        # 마지막 BBox인 경우 루프를 빠져나옴
+        if idx.size(0) == 1:
+            break
+
+        # 현재 conf 최대의 index를 keep에 저장했으므로, idx를 하나 감소시킴
+        idx = idx[:-1]
+
+        # -------------------
+        # 이제부터 keep에 저장한 BBox과 크게 겹치는 BBox를 추출하여 삭제한다
+        # -------------------
+        # 하나 감소시킨 idx까지의 BBox를, out으로 지정한 변수로 작성한다
+        torch.index_select(x1, 0, idx, out=tmp_x1)
+        torch.index_select(y1, 0, idx, out=tmp_y1)
+        torch.index_select(x2, 0, idx, out=tmp_x2)
+        torch.index_select(y2, 0, idx, out=tmp_y2)
+
+        # 모든 BBox에 대해, 현재 BBox=index가 i로 겹치는 값까지로 설정(clamp)
+        tmp_x1 = torch.clamp(tmp_x1, min=x1[i])
+        tmp_y1 = torch.clamp(tmp_y1, min=y1[i])
+        tmp_x2 = torch.clamp(tmp_x2, max=x2[i])
+        tmp_y2 = torch.clamp(tmp_y2, max=y2[i])
+
+        # w와 h의 텐서 크기를 index를 하나 줄인 것으로 한다
+        tmp_w.resize_as_(tmp_x2)
+        tmp_h.resize_as_(tmp_y2)
+
+        # clamp한 상태에서 BBox의 폭과 높이를 구한다
+        tmp_w = tmp_x2 - tmp_x1
+        tmp_h = tmp_y2 - tmp_y1
+
+        # 폭이나 높이가 음수인 것은 0으로 한다
+        tmp_w = torch.clamp(tmp_w, min=0.0)
+        tmp_h = torch.clamp(tmp_h, min=0.0)
+
+        # clamp된 상태의 면적을 구한다
+        inter = tmp_w*tmp_h
+
+        # IoU = intersect부분 / (area(a) + area(b) - intersect부분)의 계산
+        rem_areas = torch.index_select(area, 0, idx)  # 각 BBox의 원래 면적
+        union = (rem_areas - inter) + area[i]  # 두 구역의 합(OR)의 면적
+        IoU = inter/union
+
+        # IoU가 overlap보다 작은 idx만 남긴다
+        idx = idx[IoU.le(overlap)]  # le은 Less than or Equal to 처리를 하는 연산입니다
+        # IoU가 overlap보다 큰 idx는 처음 선택한 keep에 저장한 idx과 동일한 물체에 대해 BBox를 둘러싸고 있으므로 삭제
+
+    # while 루프에서 빠져나오면 종료
+
+    return keep, count
+
+
 # SSD 추론시에 conf와 loc의 출력에서 겹침(중복)을 제거한 BBox를 출력한다
 class Detect(Function):
 
@@ -695,66 +865,3 @@ class Detect(Function):
                                                    boxes[ids[:count]]), 1)
 
         return output  # torch.Size([1, 21, 200, 5])
-
-
-# SSD 클래스를 작성한다
-class SSD(nn.Module):
-
-    def __init__(self, phase, cfg):
-        super(SSD, self).__init__()
-
-        self.phase = phase  # train or inference를 지정
-        self.num_classes = cfg["num_classes"]  # 클래스 수 21
-
-        # SSD 네트워크를 작성
-        self.vgg = make_vgg()
-        self.extras = make_extras()
-        self.L2Norm = L2Norm()
-        self.loc, self.conf = make_loc_conf(
-            cfg["num_classes"], cfg["bbox_aspect_num"])
-
-        # DBox 작성
-        dbox = DBox(cfg)
-        self.dbox_list = dbox.make_dbox_list()
-
-        # 추론시는 "Detect" 클래스를 준비합니다
-        if phase == 'inference':
-            self.detect = Detect()
-
-# 동작 확인
-ssd_test = SSD(phase="train", cfg=ssd_cfg)
-print(ssd_test)
-
-
-# 오프셋 정보를 이용하여 DBox를 BBox로 변환하는 함수
-def decode(loc, dbox_list):
-    """
-    오프셋 정보를 이용하여 DBox를 BBox로 변환한다.
-
-    Parameters
-    ----------
-    loc:  [8732,4]
-        SSD 모델로 추론하는 오프셋 정보.
-    dbox_list: [8732,4]
-        DBox 정보
-
-    Returns
-    -------
-    boxes : [xmin, ymin, xmax, ymax]
-        BBox 정보
-    """
-
-    # DBox는 [cx, cy, width, height]로 저장되어 있음
-    # loc도 [Δcx, Δcy, Δwidth, Δheight]로 저장되어 있음
-
-    # 오프셋 정보로 BBox를 구한다
-    boxes = torch.cat((
-        dbox_list[:, :2] + loc[:, :2] * 0.1 * dbox_list[:, 2:],
-        dbox_list[:, 2:] * torch.exp(loc[:, 2:] * 0.2)), dim=1)
-    # boxes의 크기는 torch.Size([8732, 4])가 됩니다
-
-    # BBox의 좌표정보를 [cx, cy, width, height]에서 [xmin, ymin, xmax, ymax]으로 변경
-    boxes[:, :2] -= boxes[:, 2:] / 2  # 좌표 (xmin,ymin)로 변환
-    boxes[:, 2:] += boxes[:, :2]  # 좌표 (xmax,ymax)로 변환
-
-    return boxes
